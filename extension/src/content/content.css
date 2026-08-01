@@ -1,0 +1,117 @@
+/* RTL Picker — injected styles.
+ * The `html` prefix bumps specificity above the page's own rules so we win
+ * even when both sides use !important and injection order is unpredictable.
+ * `text-align: start` resolves to right under rtl without hard-coding a side,
+ * so centred and justified layouts survive.
+ */
+
+html [data-rtlp='rtl'],
+html [data-rtlp-auto='rtl'] {
+  direction: rtl !important;
+  text-align: start !important;
+}
+
+html [data-rtlp='ltr'],
+html [data-rtlp-auto='ltr'] {
+  direction: ltr !important;
+  text-align: start !important;
+}
+
+/* A manual rule always beats auto-detect on the same element. */
+html [data-rtlp='ltr'][data-rtlp-auto='rtl'] {
+  direction: ltr !important;
+}
+
+/* ---------- picker overlay ---------- */
+
+html.rtlp-picking,
+html.rtlp-picking * {
+  cursor: crosshair !important;
+}
+
+#rtlp-highlight {
+  position: fixed;
+  z-index: 2147483646;
+  pointer-events: none;
+  border: 2px solid #2f81f7;
+  background: rgba(47, 129, 247, 0.16);
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7);
+  transition: all 60ms linear;
+  display: none;
+}
+
+#rtlp-hud {
+  position: fixed;
+  z-index: 2147483647;
+  inset-block-end: 16px;
+  inset-inline-start: 16px;
+  max-width: min(520px, calc(100vw - 32px));
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #14161a;
+  color: #e8eaed;
+  font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+  direction: ltr;
+  text-align: left;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+  display: none;
+}
+
+#rtlp-hud .rtlp-sel {
+  display: block;
+  margin: 6px 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: #23262c;
+  color: #8ed0ff;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+  max-height: 4.5em;
+  overflow: hidden;
+}
+
+#rtlp-hud .rtlp-count {
+  color: #9aa3ae;
+}
+
+#rtlp-hud .rtlp-keys {
+  margin-top: 8px;
+  color: #9aa3ae;
+  font-size: 12px;
+}
+
+#rtlp-hud kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  border: 1px solid #3a3f47;
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: #23262c;
+  color: #e8eaed;
+  font: inherit;
+  font-size: 11px;
+}
+
+#rtlp-toast {
+  position: fixed;
+  z-index: 2147483647;
+  inset-block-start: 16px;
+  inset-inline-end: 16px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: #14161a;
+  color: #e8eaed;
+  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+  direction: ltr;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+#rtlp-toast.rtlp-show {
+  opacity: 1;
+}

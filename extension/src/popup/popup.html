@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>RTL Picker</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <span class="logo" aria-hidden="true"></span>
+        <div>
+          <h1>RTL Picker</h1>
+          <p class="site" id="site">…</p>
+        </div>
+      </div>
+      <label class="switch" title="Enable on this site">
+        <input type="checkbox" id="site-enabled" />
+        <span class="track"><span class="thumb"></span></span>
+      </label>
+    </header>
+
+    <p class="status" id="status"></p>
+
+    <button class="primary" id="pick">
+      Pick an element<span class="hint">Alt+Shift+P</span>
+    </button>
+
+    <section class="options">
+      <label class="row">
+        <input type="checkbox" id="auto" />
+        <span>
+          <b>Auto-detect RTL text</b>
+          <small>Flip any block that is mostly Arabic, Hebrew or Persian.</small>
+        </span>
+      </label>
+
+      <label class="row">
+        <input type="checkbox" id="fields" />
+        <span>
+          <b>Flip input boxes while typing</b>
+          <small>Chat composers, search fields, rich-text editors.</small>
+        </span>
+      </label>
+
+      <label class="row">
+        <input type="checkbox" id="skipCode" />
+        <span>
+          <b>Leave code blocks alone</b>
+          <small>Keeps <code>&lt;pre&gt;</code> and <code>&lt;code&gt;</code> left-to-right.</small>
+        </span>
+      </label>
+
+      <div class="row slider">
+        <span>
+          <b>Sensitivity</b>
+          <small id="threshold-label">Flip at 25% RTL characters</small>
+        </span>
+        <input type="range" id="threshold" min="5" max="90" step="5" />
+      </div>
+    </section>
+
+    <section class="rules">
+      <div class="rules-head">
+        <h2>Saved rules <span class="badge" id="rule-count">0</span></h2>
+        <button class="link danger" id="clear-rules" hidden>Clear all</button>
+      </div>
+      <ul id="rule-list"></ul>
+      <p class="empty" id="rules-empty">
+        Nothing saved for this site yet. Use <b>Pick an element</b>, then click any block on the
+        page.
+      </p>
+    </section>
+
+    <footer>
+      <label class="row compact">
+        <input type="checkbox" id="enabled" />
+        <span><b>Extension enabled</b><small>Master switch for every site.</small></span>
+      </label>
+      <p class="keys">
+        <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> toggle this site ·
+        <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> picker
+      </p>
+    </footer>
+
+    <script src="../core/settings.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "RTL Picker",
+  "version": "1.0.0",
+  "description": "Flip Arabic/Hebrew/Persian text to right-to-left in any AI chat or website. Auto-detects, or pick any block by hand.",
+  "homepage_url": "https://github.com/kareem-alargoon/rtl-picker",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "RTL Picker",
+    "default_popup": "src/popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "src/background/service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": [
+        "src/core/detect.js",
+        "src/core/selector.js",
+        "src/core/settings.js",
+        "src/content/picker.js",
+        "src/content/content.js"
+      ],
+      "css": ["src/content/content.css"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": false
+    }
+  ],
+  "commands": {
+    "toggle-site": {
+      "suggested_key": { "default": "Alt+Shift+R" },
+      "description": "Turn RTL Picker on/off for this site"
+    },
+    "start-picker": {
+      "suggested_key": { "default": "Alt+Shift+P" },
+      "description": "Pick an element to force RTL"
+    }
+  }
+}
