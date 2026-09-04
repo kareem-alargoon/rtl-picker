@@ -21,7 +21,7 @@ Two independent pieces, usable separately:
 | | What it covers | How |
 | --- | --- | --- |
 | **`extension/`** | ChatGPT, Claude, Gemini, Grok, Perplexity, and every other website | Chrome/Edge extension (Manifest V3) |
-| **`desktop/`** | Word, Notepad, Slack, VS Code, Electron apps — including read-only text | Native Windows tray app, 35 KB, no install |
+| **`desktop/`** | Word, Notepad, Slack, VS Code, Electron apps — including read-only text | Native Windows tray app, ~48 KB, no install |
 
 ## Quick start
 
@@ -114,7 +114,7 @@ everywhere.
 
 ### Run it
 
-Double-click **`desktop\RTLPicker.exe`**. That's it — a real 35 KB executable, no install, no
+Double-click **`desktop\RTLPicker.exe`**. That's it — a real ~48 KB executable, no install, no
 dependencies beyond the .NET Framework that ships with Windows. It lives in the system tray;
 right-click for the menu, including **Start with Windows**.
 
@@ -163,7 +163,9 @@ registry key, and running both at once means they fight over the same global hot
 | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd> | native paragraph direction → LTR | Word, WordPad, Outlook only |
 
 They're deliberately different from the extension's <kbd>Alt</kbd>+<kbd>Shift</kbd> shortcuts — a
-global hotkey would otherwise steal them from Chrome.
+global hotkey would otherwise steal them from Chrome. These are only the defaults: rebind any of them
+from **Keyboard shortcuts…** in the tray menu (see below). If one is already taken when the app
+starts, it falls back to an alternate automatically and tells you which.
 
 **The first three edit the text itself**, wrapping it in Unicode bidi control characters (`U+202B` …
 `U+202C`). Any app implementing the Unicode bidirectional algorithm then lays that run out
@@ -180,6 +182,18 @@ to see what the tool does.
 
 **Wrap each line separately** (tray menu, on by default) gives every line its own RTL run. Turn it
 off to treat the whole selection as one.
+
+**Keyboard shortcuts…** (tray menu) lets you pick your own key for every action. Click a box, press
+the chord you want, and **Save** — the global hotkeys are re-registered live, with no restart. If a
+key is already owned by another app, the old one is kept and you're told which clashed. **Clear** on
+any row removes its hotkey entirely; that action then runs only from the tray menu, freeing the key
+for something else.
+
+**Choose apps it works in…** (tray menu) scopes where the shortcuts fire. Global hotkeys can't be
+limited to one app by Windows itself, so the tool checks the focused app when a key is pressed:
+leave it at *every app* (the default), restrict it to *only* a ticked set, or block an *except* set.
+Tick from the list of running apps or type a name like `chrome`. Choices persist in
+`%LOCALAPPDATA%\RTLPicker\settings.ini`.
 
 Every action shows a small toast in the corner — a custom window, not a balloon tip, because Windows
 notification settings silently swallow those. Actions are also written to
