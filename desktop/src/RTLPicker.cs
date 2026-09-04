@@ -101,6 +101,18 @@ namespace RtlPicker
             catch { }
             return name + " [" + cls + "] \"" + title + "\"";
         }
+
+        /// Lowercased process name (no .exe) of the app that owns the foreground
+        /// window -- the value the app filter matches against. Empty if unknown.
+        internal static string ForegroundProcessName()
+        {
+            IntPtr h = GetForegroundWindow();
+            if (h == IntPtr.Zero) return "";
+            uint pid;
+            GetWindowThreadProcessId(h, out pid);
+            try { return System.Diagnostics.Process.GetProcessById((int)pid).ProcessName.ToLowerInvariant(); }
+            catch { return ""; }
+        }
     }
 
     internal class HotkeyWindow : NativeWindow, IDisposable
@@ -124,6 +136,12 @@ namespace RtlPicker
             bool ok = RegisterHotKey(Handle, id, modifiers | 0x4000, vk);
             if (ok && !registered.Contains(id)) registered.Add(id);
             return ok;
+        }
+
+        public void UnregisterAll()
+        {
+            foreach (int id in registered) UnregisterHotKey(Handle, id);
+            registered.Clear();
         }
 
         protected override void WndProc(ref Message m)
@@ -252,6 +270,120 @@ namespace RtlPicker
                 System.IO.File.AppendAllText(File, line, Encoding.UTF8);
             }
             catch { }
+        }
+    }
+
+    // ----------------------------------------------------------------- config
+
+    /// A flat key=value file next to the log. Deliberately tiny -- no JSON
+    /// dependency, hand-editable, and forgiving of missing or junk lines so a
+    /// half-written file never stops the app from starting.
+    internal static class Config
+    {
+        internal static readonly string File = Path.Combine(Log.Dir, "settings.ini");
+
+        private static readonly Dictionary<string, string> map =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        internal static void Load()
+        {
+            map.Clear();
+            try
+            {
+                if (!System.IO.File.Exists(File)) return;
+                foreach (string raw in System.IO.File.ReadAllLines(File, Encoding.UTF8))
+                {
+                    string line = raw.Trim();
+                    if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    map[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+                }
+            }
+            catch (Exception ex) { Log.Write("config load failed: " + ex.Message); }
+        }
+
+        internal static void Save()
+        {
+            try
+            {
+                if (!Directory.Exists(Log.Dir)) Directory.CreateDirectory(Log.Dir);
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine("# RTL Picker settings. Edited by the tray menu; hand-editing is fine.");
+                foreach (KeyValuePair<string, string> kv in map)
+                    sb.AppendLine(kv.Key + "=" + kv.Value);
+                System.IO.File.WriteAllText(File, sb.ToString(), Encoding.UTF8);
+            }
+            catch (Exception ex) { Log.Write("config save failed: " + ex.Message); }
+        }
+
+        internal static string Get(string key, string fallback)
+        {
+            string v;
+            return map.TryGetValue(key, out v) ? v : fallback;
+        }
+
+        internal static void Set(string key, string value) { map[key] = value; }
+
+        internal static bool GetBool(string key, bool fallback)
+        {
+            string v = Get(key, null);
+            if (v == null) return fallback;
+            return v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static void SetBool(string key, bool value) { map[key] = value ? "1" : "0"; }
+    }
+
+    // ------------------------------------------------------------- app filter
+
+    internal enum FilterMode { All, Only, Except }
+
+    /// Decides whether a hotkey should act in the app that currently has focus.
+    /// The OS registers global hotkeys machine-wide, so scoping cannot happen at
+    /// registration time -- it has to be a check when the key fires.
+    internal class AppFilter
+    {
+        internal FilterMode Mode = FilterMode.All;
+        // Lowercased process names without the .exe suffix, e.g. "chrome".
+        internal readonly List<string> Apps = new List<string>();
+
+        internal void Load()
+        {
+            string m = Config.Get("filter.mode", "all").ToLowerInvariant();
+            Mode = m == "only" ? FilterMode.Only : m == "except" ? FilterMode.Except : FilterMode.All;
+
+            Apps.Clear();
+            foreach (string part in Config.Get("filter.apps", "").Split(','))
+            {
+                string name = Normalize(part);
+                if (name.Length > 0 && !Apps.Contains(name)) Apps.Add(name);
+            }
+        }
+
+        internal void Save()
+        {
+            Config.Set("filter.mode", Mode == FilterMode.Only ? "only" : Mode == FilterMode.Except ? "except" : "all");
+            Config.Set("filter.apps", string.Join(",", Apps.ToArray()));
+            Config.Save();
+        }
+
+        /// Strips path, ".exe", and case so "C:\...\Chrome.exe" and "chrome" match.
+        internal static string Normalize(string name)
+        {
+            if (name == null) return "";
+            name = name.Trim().ToLowerInvariant();
+            int slash = Math.Max(name.LastIndexOf('\\'), name.LastIndexOf('/'));
+            if (slash >= 0) name = name.Substring(slash + 1);
+            if (name.EndsWith(".exe")) name = name.Substring(0, name.Length - 4);
+            return name;
+        }
+
+        internal bool Allows(string processName)
+        {
+            if (Mode == FilterMode.All) return true;
+            bool listed = Apps.Contains(Normalize(processName));
+            return Mode == FilterMode.Only ? listed : !listed;
         }
     }
 
@@ -567,6 +699,328 @@ namespace RtlPicker
         internal Action Run;
     }
 
+    /// Translates between the Win32 hotkey representation (mods bitmask + virtual
+    /// key) and the "Ctrl+Alt+D" strings shown in the menu and shortcut editor.
+    internal static class Chord
+    {
+        internal const uint MOD_ALT = 1, MOD_CONTROL = 2, MOD_SHIFT = 4;
+
+        internal static string Display(uint mods, uint vk)
+        {
+            return Modifiers(mods) + KeyName(vk);
+        }
+
+        internal static string Modifiers(uint mods)
+        {
+            StringBuilder sb = new StringBuilder();
+            if ((mods & MOD_CONTROL) != 0) sb.Append("Ctrl+");
+            if ((mods & MOD_ALT) != 0) sb.Append("Alt+");
+            if ((mods & MOD_SHIFT) != 0) sb.Append("Shift+");
+            return sb.ToString();
+        }
+
+        private static string KeyName(uint vk)
+        {
+            Keys k = (Keys)vk;
+            // Keys.D0..D9 render as "D0"; show the digit users actually pressed.
+            if (k >= Keys.D0 && k <= Keys.D9) return ((char)('0' + (k - Keys.D0))).ToString();
+            return k.ToString();
+        }
+
+        /// A chord is usable as a global hotkey only with at least one modifier
+        /// and a real (non-modifier) key. Lets the editor reject junk captures.
+        internal static bool IsValid(uint mods, uint vk)
+        {
+            if (mods == 0 || vk == 0) return false;
+            Keys k = (Keys)vk;
+            return k != Keys.ControlKey && k != Keys.Menu && k != Keys.ShiftKey
+                && k != Keys.LControlKey && k != Keys.RControlKey
+                && k != Keys.LMenu && k != Keys.RMenu
+                && k != Keys.LShiftKey && k != Keys.RShiftKey;
+        }
+    }
+
+    // ------------------------------------------------------------ app filter UI
+
+    /// Lets the user say where the shortcuts apply: everywhere, only in a chosen
+    /// set of apps, or everywhere except a chosen set. The list mixes currently
+    /// running apps with any names already saved, so a saved app that is closed
+    /// right now is not silently dropped.
+    internal class AppFilterForm : Form
+    {
+        private readonly AppFilter filter;
+        private readonly Action onSave;
+        private readonly RadioButton modeAll = new RadioButton();
+        private readonly RadioButton modeOnly = new RadioButton();
+        private readonly RadioButton modeExcept = new RadioButton();
+        private readonly CheckedListBox list = new CheckedListBox();
+        private readonly TextBox manual = new TextBox();
+
+        internal AppFilterForm(AppFilter f, Action save)
+        {
+            filter = f;
+            onSave = save;
+
+            Text = "RTL Picker -- choose apps";
+            Size = new Size(430, 520);
+            StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+            catch { }
+
+            Label intro = new Label();
+            intro.Text = "Where should the RTL Picker shortcuts work?";
+            intro.SetBounds(14, 12, 390, 20);
+            Controls.Add(intro);
+
+            modeAll.Text = "Work in every app";
+            modeAll.SetBounds(18, 38, 380, 22);
+            modeOnly.Text = "Work only in the ticked apps";
+            modeOnly.SetBounds(18, 62, 380, 22);
+            modeExcept.Text = "Work everywhere except the ticked apps";
+            modeExcept.SetBounds(18, 86, 380, 22);
+            Controls.Add(modeAll);
+            Controls.Add(modeOnly);
+            Controls.Add(modeExcept);
+            modeAll.Checked = filter.Mode == FilterMode.All;
+            modeOnly.Checked = filter.Mode == FilterMode.Only;
+            modeExcept.Checked = filter.Mode == FilterMode.Except;
+            EventHandler modeChanged = delegate { UpdateListEnabled(); };
+            modeAll.CheckedChanged += modeChanged;
+            modeOnly.CheckedChanged += modeChanged;
+            modeExcept.CheckedChanged += modeChanged;
+
+            list.SetBounds(18, 116, 384, 288);
+            list.CheckOnClick = true;
+            list.IntegralHeight = false;
+            Controls.Add(list);
+
+            Label addLbl = new Label();
+            addLbl.Text = "Add an app by name (e.g. chrome):";
+            addLbl.SetBounds(18, 410, 384, 18);
+            Controls.Add(addLbl);
+
+            manual.SetBounds(18, 430, 250, 24);
+            Controls.Add(manual);
+
+            Button add = new Button();
+            add.Text = "Add";
+            add.SetBounds(276, 429, 60, 26);
+            add.Click += delegate { AddManual(); };
+            Controls.Add(add);
+
+            Button refresh = new Button();
+            refresh.Text = "Refresh";
+            refresh.SetBounds(342, 429, 60, 26);
+            refresh.Click += delegate { Populate(); };
+            Controls.Add(refresh);
+
+            Button ok = new Button();
+            ok.Text = "Save";
+            ok.SetBounds(232, 464, 80, 28);
+            ok.Click += delegate { SaveAndClose(); };
+            Controls.Add(ok);
+
+            Button cancel = new Button();
+            cancel.Text = "Cancel";
+            cancel.SetBounds(320, 464, 80, 28);
+            cancel.Click += delegate { Close(); };
+            Controls.Add(cancel);
+            AcceptButton = ok;
+            CancelButton = cancel;
+
+            Populate();
+            UpdateListEnabled();
+        }
+
+        private void UpdateListEnabled()
+        {
+            bool needsList = !modeAll.Checked;
+            list.Enabled = needsList;
+            manual.Enabled = needsList;
+        }
+
+        /// Union of running apps (those with a visible window) and already-saved
+        /// names, sorted, with saved ones ticked.
+        private void Populate()
+        {
+            // Remember current ticks so a refresh does not lose them.
+            List<string> ticked = CheckedNames();
+            foreach (string s in filter.Apps) if (!ticked.Contains(s)) ticked.Add(s);
+
+            List<string> names = new List<string>(ticked);
+            try
+            {
+                foreach (System.Diagnostics.Process p in System.Diagnostics.Process.GetProcesses())
+                {
+                    try
+                    {
+                        if (p.MainWindowHandle == IntPtr.Zero) continue;
+                        if (string.IsNullOrEmpty(p.MainWindowTitle)) continue;
+                        string n = p.ProcessName.ToLowerInvariant();
+                        if (n == "rtlpicker") continue;
+                        if (!names.Contains(n)) names.Add(n);
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+
+            list.BeginUpdate();
+            list.Items.Clear();
+            foreach (string n in names) list.Items.Add(n, ticked.Contains(n));
+            list.EndUpdate();
+        }
+
+        private void AddManual()
+        {
+            string n = AppFilter.Normalize(manual.Text);
+            if (n.Length == 0) return;
+            int idx = list.Items.IndexOf(n);
+            if (idx < 0) idx = list.Items.Add(n);
+            list.SetItemChecked(idx, true);
+            manual.Clear();
+            if (modeAll.Checked) modeOnly.Checked = true;
+        }
+
+        private List<string> CheckedNames()
+        {
+            List<string> result = new List<string>();
+            foreach (object o in list.CheckedItems)
+            {
+                string n = AppFilter.Normalize(o.ToString());
+                if (n.Length > 0 && !result.Contains(n)) result.Add(n);
+            }
+            return result;
+        }
+
+        private void SaveAndClose()
+        {
+            filter.Mode = modeOnly.Checked ? FilterMode.Only
+                        : modeExcept.Checked ? FilterMode.Except : FilterMode.All;
+            filter.Apps.Clear();
+            if (filter.Mode != FilterMode.All) filter.Apps.AddRange(CheckedNames());
+            onSave();
+            Close();
+        }
+    }
+
+    // ---------------------------------------------------------- shortcut editor
+
+    /// One recorder box per action. Focus a box, press the chord you want, and
+    /// it is captured; Save re-registers the global hotkeys live.
+    internal class ShortcutForm : Form
+    {
+        private readonly Action<Dictionary<int, uint[]>> onApply;
+        // Live selection per action id: {mods, vk}.
+        private readonly Dictionary<int, uint[]> chosen = new Dictionary<int, uint[]>();
+
+        internal ShortcutForm(HotAction[] actions, Action<Dictionary<int, uint[]>> apply)
+        {
+            onApply = apply;
+
+            Text = "RTL Picker -- keyboard shortcuts";
+            Size = new Size(580, 130 + actions.Length * 34);
+            StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+            catch { }
+
+            Label intro = new Label();
+            intro.Text = "Click a box and press the keys you want (e.g. Ctrl+Alt+D)."
+                + "  Clear removes the key -- the action still runs from the tray menu.";
+            intro.SetBounds(14, 12, 550, 34);
+            Controls.Add(intro);
+
+            int y = 54;
+            foreach (HotAction a in actions)
+            {
+                chosen[a.Id] = new uint[] { a.Mods, a.Vk };
+
+                Label name = new Label();
+                name.Text = a.Name;
+                name.SetBounds(16, y + 4, 250, 22);
+                Controls.Add(name);
+
+                TextBox box = new TextBox();
+                box.ReadOnly = true;
+                box.Cursor = Cursors.Hand;
+                box.BackColor = Color.White;
+                box.TextAlign = HorizontalAlignment.Center;
+                box.Text = a.Keys;
+                box.Tag = a.Id;
+                box.SetBounds(272, y, 190, 24);
+                box.GotFocus += delegate { box.Text = "press keys..."; };
+                box.LostFocus += delegate { RefreshBox(box); };
+                box.PreviewKeyDown += delegate(object s, PreviewKeyDownEventArgs e) { e.IsInputKey = true; };
+                box.KeyDown += delegate(object s, KeyEventArgs e) { CaptureChord(box, e); };
+                Controls.Add(box);
+
+                TextBox captured = box;
+                int id = a.Id;
+                Button clear = new Button();
+                clear.Text = "Clear";
+                clear.SetBounds(468, y - 1, 70, 26);
+                clear.Click += delegate
+                {
+                    chosen[id] = new uint[] { 0, 0 };
+                    captured.Text = "(none)";
+                };
+                Controls.Add(clear);
+
+                y += 34;
+            }
+
+            Button ok = new Button();
+            ok.Text = "Save";
+            ok.SetBounds(380, y + 10, 80, 28);
+            ok.Click += delegate { onApply(chosen); Close(); };
+            Controls.Add(ok);
+
+            Button cancel = new Button();
+            cancel.Text = "Cancel";
+            cancel.SetBounds(468, y + 10, 80, 28);
+            cancel.Click += delegate { Close(); };
+            Controls.Add(cancel);
+            CancelButton = cancel;
+        }
+
+        private void CaptureChord(TextBox box, KeyEventArgs e)
+        {
+            e.SuppressKeyPress = true;
+            e.Handled = true;
+
+            uint mods = 0;
+            if (e.Control) mods |= Chord.MOD_CONTROL;
+            if (e.Alt) mods |= Chord.MOD_ALT;
+            if (e.Shift) mods |= Chord.MOD_SHIFT;
+            uint vk = (uint)e.KeyCode;
+
+            // Ignore presses that are only a modifier -- wait for the real key.
+            if (!Chord.IsValid(mods, vk))
+            {
+                box.Text = mods == 0 ? "press keys..." : Chord.Modifiers(mods) + "...";
+                return;
+            }
+
+            int id = (int)box.Tag;
+            chosen[id] = new uint[] { mods, vk };
+            box.Text = Chord.Display(mods, vk);
+        }
+
+        private void RefreshBox(TextBox box)
+        {
+            int id = (int)box.Tag;
+            uint[] c = chosen[id];
+            box.Text = Chord.IsValid(c[0], c[1]) ? Chord.Display(c[0], c[1]) : "(none)";
+        }
+    }
+
     // -------------------------------------------------------------- tray app
 
     internal class TrayApp : ApplicationContext
@@ -578,9 +1032,13 @@ namespace RtlPicker
         private readonly HotkeyWindow hotkeys = new HotkeyWindow();
         private readonly ToastForm toast = new ToastForm();
         private readonly Dictionary<int, HotAction> byId = new Dictionary<int, HotAction>();
+        private readonly AppFilter filter = new AppFilter();
 
+        private HotAction[] actions;
         private ReaderForm reader;
         private ComposeForm compose;
+        private AppFilterForm filterForm;
+        private ShortcutForm shortcutForm;
         private bool wrapPerLine = true;
 
         private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -588,7 +1046,12 @@ namespace RtlPicker
 
         internal TrayApp()
         {
-            HotAction[] actions = BuildActions();
+            Config.Load();
+            filter.Load();
+            wrapPerLine = Config.GetBool("wrapPerLine", true);
+
+            actions = BuildActions();
+            LoadShortcutOverrides(actions);
             foreach (HotAction a in actions) byId[a.Id] = a;
 
             List<string> failed = new List<string>();
@@ -600,7 +1063,9 @@ namespace RtlPicker
                 try
                 {
                     HotAction a;
-                    if (byId.TryGetValue(id, out a)) a.Run();
+                    if (!byId.TryGetValue(id, out a)) return;
+                    if (!PassesFilter()) return;
+                    a.Run();
                 }
                 catch (Exception ex)
                 {
@@ -621,19 +1086,117 @@ namespace RtlPicker
             notify.Visible = true;
 
             Log.Write("--- started (native) ---");
-            string readerKey = byId[6].Keys;
+            HotAction readerAction = byId[6];
+            bool readerHasKey = readerAction.Mods != 0 && readerAction.Vk != 0;
             if (failed.Count > 0)
                 toast.Show("Some shortcuts are taken", string.Join(", ", failed.ToArray()) + " -- another app owns them.");
             else if (rebound.Count > 0)
                 toast.Show("Shortcut changed", string.Join("; ", rebound.ToArray()));
+            else if (readerHasKey)
+                toast.Show("RTL Picker is running", "Select text, press " + readerAction.Keys + " to read it in RTL.");
             else
-                toast.Show("RTL Picker is running", "Select text, press " + readerKey + " to read it in RTL.");
+                toast.Show("RTL Picker is running", "Right-click the tray icon for its menu.");
         }
 
         private static Icon LoadIcon()
         {
             try { return Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
             catch { return SystemIcons.Application; }
+        }
+
+        /// True when the app that has focus is allowed by the current filter.
+        /// Global hotkeys are swallowed either way, so a blocked app gets a short
+        /// toast rather than silence -- otherwise the tool just looks broken.
+        private bool PassesFilter()
+        {
+            if (filter.Mode == FilterMode.All) return true;
+            string proc = Native.ForegroundProcessName();
+            if (filter.Allows(proc)) return true;
+            Log.Write("filtered out: '" + proc + "' (mode=" + filter.Mode + ")");
+            toast.Show("RTL Picker is off here",
+                (proc.Length == 0 ? "This app" : proc) + " is not in your list. Change it from the tray menu.");
+            return false;
+        }
+
+        /// Replaces default chords with any the user saved. Stored as "mods,vk"
+        /// integers so no key-name parsing is needed on load.
+        private static void LoadShortcutOverrides(HotAction[] actions)
+        {
+            foreach (HotAction a in actions)
+            {
+                string saved = Config.Get("shortcut." + a.Id, null);
+                if (string.IsNullOrEmpty(saved)) continue;
+
+                // "none" means the user deliberately unset this hotkey; the action
+                // still runs from the tray menu, it just has no key.
+                if (saved.Equals("none", StringComparison.OrdinalIgnoreCase))
+                {
+                    a.Mods = 0; a.Vk = 0; a.Keys = "(none)";
+                    continue;
+                }
+
+                string[] parts = saved.Split(',');
+                uint mods, vk;
+                if (parts.Length == 2
+                    && uint.TryParse(parts[0].Trim(), out mods)
+                    && uint.TryParse(parts[1].Trim(), out vk)
+                    && Chord.IsValid(mods, vk))
+                {
+                    a.Mods = mods;
+                    a.Vk = vk;
+                    a.Keys = Chord.Display(mods, vk);
+                }
+            }
+        }
+
+        /// Applies chords chosen in the editor, live -- no restart. Unregisters
+        /// everything, then registers the new set; anything that collides with
+        /// another app is reverted to what it was and reported back.
+        private void ApplyShortcuts(Dictionary<int, uint[]> chosen)
+        {
+            hotkeys.UnregisterAll();
+            List<string> taken = new List<string>();
+
+            foreach (HotAction a in actions)
+            {
+                uint[] pick;
+                uint oldMods = a.Mods, oldVk = a.Vk;
+                string oldKeys = a.Keys;
+
+                uint mods = oldMods, vk = oldVk;
+                if (chosen.TryGetValue(a.Id, out pick)) { mods = pick[0]; vk = pick[1]; }
+                bool changed = mods != oldMods || vk != oldVk;
+
+                // Cleared: leave it unregistered. The tray menu still runs it.
+                if (mods == 0 || vk == 0)
+                {
+                    a.Mods = 0; a.Vk = 0; a.Keys = "(none)";
+                    Config.Set("shortcut." + a.Id, "none");
+                    continue;
+                }
+
+                if (hotkeys.Register(a.Id, mods, vk))
+                {
+                    a.Mods = mods; a.Vk = vk; a.Keys = Chord.Display(mods, vk);
+                    Config.Set("shortcut." + a.Id, mods + "," + vk);
+                }
+                else
+                {
+                    // Put the previous, working chord back so the action survives.
+                    if (oldMods != 0 && oldVk != 0) hotkeys.Register(a.Id, oldMods, oldVk);
+                    a.Mods = oldMods; a.Vk = oldVk; a.Keys = oldKeys;
+                    if (changed) taken.Add(Chord.Display(mods, vk) + " (" + a.Name + ")");
+                }
+            }
+
+            Config.Save();
+            BuildMenu(actions);
+
+            if (taken.Count > 0)
+                toast.Show("Some shortcuts are taken",
+                    string.Join(", ", taken.ToArray()) + " -- another app owns them, kept the old key.");
+            else
+                toast.Show("Shortcuts updated", "Your new keys are active now.");
         }
 
         private HotAction[] BuildActions()
@@ -669,6 +1232,13 @@ namespace RtlPicker
         {
             foreach (HotAction a in actions)
             {
+                // Deliberately unset -- no key to register; menu still runs it.
+                if (a.Mods == 0 || a.Vk == 0)
+                {
+                    Log.Write("no shortcut for " + a.Name + " (cleared by user)");
+                    continue;
+                }
+
                 bool ok = hotkeys.Register(a.Id, a.Mods, a.Vk);
                 if (!ok)
                 {
@@ -691,6 +1261,10 @@ namespace RtlPicker
 
         private void BuildMenu(HotAction[] actions)
         {
+            // Re-callable: the shortcut editor rebuilds the menu to refresh the
+            // key hints shown next to each action.
+            menu.Items.Clear();
+
             ToolStripMenuItem readClip = new ToolStripMenuItem("Read clipboard in RTL");
             readClip.Font = new Font(menu.Font, FontStyle.Bold);
             readClip.Click += delegate { ReadClipboard(); };
@@ -717,8 +1291,23 @@ namespace RtlPicker
             perLine.CheckOnClick = true;
             perLine.Checked = wrapPerLine;
             perLine.ToolTipText = "On: every line becomes its own RTL run. Off: one run for the whole selection.";
-            perLine.Click += delegate { wrapPerLine = perLine.Checked; };
+            perLine.Click += delegate
+            {
+                wrapPerLine = perLine.Checked;
+                Config.SetBool("wrapPerLine", wrapPerLine);
+                Config.Save();
+            };
             menu.Items.Add(perLine);
+
+            ToolStripMenuItem chooseApps = new ToolStripMenuItem("Choose apps it works in...");
+            chooseApps.ToolTipText = "Limit the shortcuts to certain apps, or block certain apps.";
+            chooseApps.Click += delegate { ShowAppFilter(); };
+            menu.Items.Add(chooseApps);
+
+            ToolStripMenuItem chooseKeys = new ToolStripMenuItem("Keyboard shortcuts...");
+            chooseKeys.ToolTipText = "Pick your own key for each action.";
+            chooseKeys.Click += delegate { ShowShortcutEditor(); };
+            menu.Items.Add(chooseKeys);
 
             ToolStripMenuItem startup = new ToolStripMenuItem("Start with Windows");
             startup.CheckOnClick = true;
@@ -922,6 +1511,30 @@ namespace RtlPicker
             compose.Activate();
         }
 
+        private void ShowAppFilter()
+        {
+            if (filterForm != null && !filterForm.IsDisposed) { filterForm.Activate(); return; }
+            filterForm = new AppFilterForm(filter, delegate
+            {
+                filter.Save();
+                Log.Write("filter saved: mode=" + filter.Mode + " apps=" + string.Join(",", filter.Apps.ToArray()));
+                toast.Show("App list saved",
+                    filter.Mode == FilterMode.All ? "Shortcuts work everywhere."
+                    : filter.Mode == FilterMode.Only ? "Shortcuts work only in your chosen apps."
+                    : "Shortcuts are blocked in your chosen apps.");
+            });
+            filterForm.Show();
+            filterForm.Activate();
+        }
+
+        private void ShowShortcutEditor()
+        {
+            if (shortcutForm != null && !shortcutForm.IsDisposed) { shortcutForm.Activate(); return; }
+            shortcutForm = new ShortcutForm(actions, ApplyShortcuts);
+            shortcutForm.Show();
+            shortcutForm.Activate();
+        }
+
         // ------------------------------------------------------------ startup
 
         private static bool IsRunAtStartup()
@@ -1002,6 +1615,28 @@ namespace RtlPicker
             names.Add("detects english as ltr"); results.Add(!Bidi.IsRightToLeft("plain english sentence here", 0.25));
             names.Add("ignores stray rtl word"); results.Add(!Bidi.IsRightToLeft("The city of \u0627\u0644\u0642\u0627\u0647\u0631\u0629 has many people in it", 0.25));
             names.Add("foreground window read"); results.Add(!string.IsNullOrEmpty(Native.DescribeForegroundWindow()));
+
+            // ---- app filter ----
+            AppFilter fAll = new AppFilter();
+            names.Add("filter 'all' allows anything"); results.Add(fAll.Allows("chrome"));
+
+            AppFilter fOnly = new AppFilter();
+            fOnly.Mode = FilterMode.Only; fOnly.Apps.Add("chrome");
+            names.Add("filter 'only' allows listed"); results.Add(fOnly.Allows("Chrome.exe"));
+            names.Add("filter 'only' blocks unlisted"); results.Add(!fOnly.Allows("notepad"));
+
+            AppFilter fExcept = new AppFilter();
+            fExcept.Mode = FilterMode.Except; fExcept.Apps.Add("notepad");
+            names.Add("filter 'except' blocks listed"); results.Add(!fExcept.Allows("C:\\Windows\\notepad.exe"));
+            names.Add("filter 'except' allows unlisted"); results.Add(fExcept.Allows("chrome"));
+            names.Add("normalize strips path and exe"); results.Add(AppFilter.Normalize("C:\\a\\b\\Chrome.EXE") == "chrome");
+
+            // ---- chord round-trip ----
+            names.Add("chord display Ctrl+Alt+D"); results.Add(Chord.Display(3, 0x44) == "Ctrl+Alt+D");
+            names.Add("chord display shift chord"); results.Add(Chord.Display(7, 0x52) == "Ctrl+Alt+Shift+R");
+            names.Add("chord rejects no-modifier"); results.Add(!Chord.IsValid(0, 0x44));
+            names.Add("chord rejects modifier-only"); results.Add(!Chord.IsValid(2, (uint)Keys.ControlKey));
+            names.Add("chord accepts real chord"); results.Add(Chord.IsValid(3, 0x44));
 
             int failed = 0;
             StringBuilder report = new StringBuilder();
