@@ -389,35 +389,187 @@ namespace RtlPicker
 
     // -------------------------------------------------------------- clipboard
 
+    /// Raw Win32, deliberately not System.Windows.Forms.Clipboard.
+    ///
+    /// The managed Clipboard class goes through OLE, so every call is a
+    /// synchronous cross-process round-trip into whichever app currently owns
+    /// the clipboard -- and that app has to pump messages to answer it.
+    /// Measured on a normal desktop: ~330 ms per call when another process owns
+    /// the clipboard, ~1 ms when we own it, against ~0.5 ms for the raw calls
+    /// below. It also retries internally 10 times at 100 ms before throwing,
+    /// which is invisible from the call site and turns one contended call into
+    /// a full second.
+    ///
+    /// That combination is what froze both this app and the app being copied
+    /// from: a poll loop that looked like "20 x 50 ms = 1 second" actually cost
+    /// 20 x (50 + 330) ms, with every one of those round-trips landing in the
+    /// source app's UI thread.
     internal static class Clip
     {
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool OpenClipboard(IntPtr hWndNewOwner);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool CloseClipboard();
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool EmptyClipboard();
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr GetClipboardData(uint format);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetClipboardData(uint format, IntPtr hMem);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsClipboardFormatAvailable(uint format);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetClipboardSequenceNumber();
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GlobalAlloc(uint flags, UIntPtr bytes);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GlobalFree(IntPtr handle);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GlobalLock(IntPtr handle);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool GlobalUnlock(IntPtr handle);
+
+        [DllImport("kernel32.dll")]
+        private static extern UIntPtr GlobalSize(IntPtr handle);
+
+        private const uint CF_UNICODETEXT = 13;
+        private const uint GMEM_MOVEABLE = 0x0002;
+
+        /// Only one process may have the clipboard open at a time, so a copy in
+        /// flight elsewhere makes OpenClipboard fail. Worth retrying, but only
+        /// briefly -- this runs on the UI thread.
+        private const int OpenBudgetMs = 250;
+
+        /// EmptyClipboard sets the owner to whatever window was passed to
+        /// OpenClipboard, and SetClipboardData fails outright when that owner is
+        /// NULL. So a real HWND is required, not IntPtr.Zero.
+        internal static IntPtr Owner = IntPtr.Zero;
+
+        internal static uint Sequence() { return GetClipboardSequenceNumber(); }
+
+        private static bool Open()
+        {
+            System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+            while (true)
+            {
+                if (OpenClipboard(Owner)) return true;
+                if (sw.ElapsedMilliseconds >= OpenBudgetMs) return false;
+                Thread.Sleep(10);
+            }
+        }
+
         internal static string GetText()
         {
-            for (int i = 0; i < 8; i++)
+            if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return null;
+            if (!Open()) return null;
+            try
             {
-                try { return Clipboard.ContainsText() ? Clipboard.GetText() : null; }
-                catch { Thread.Sleep(60); }
+                IntPtr h = GetClipboardData(CF_UNICODETEXT);
+                if (h == IntPtr.Zero) return null;
+
+                IntPtr p = GlobalLock(h);
+                if (p == IntPtr.Zero) return null;
+                try
+                {
+                    // Bounded by the block size rather than trusting the
+                    // terminator: a truncated handle would otherwise read past
+                    // the end of the allocation.
+                    int chars = (int)((ulong)GlobalSize(h) / 2);
+                    if (chars <= 0) return null;
+
+                    string s = Marshal.PtrToStringUni(p, chars);
+                    int nul = s.IndexOf('\0');
+                    return nul >= 0 ? s.Substring(0, nul) : s;
+                }
+                finally { GlobalUnlock(h); }
             }
-            return null;
+            finally { CloseClipboard(); }
         }
 
         internal static bool SetText(string text)
         {
-            for (int i = 0; i < 8; i++)
+            if (text == null) text = "";
+            if (!Open()) return false;
+            try
             {
-                // The clipboard is shared and lockable -- another app may hold it.
-                try { Clipboard.SetText(text); return true; }
-                catch { Thread.Sleep(60); }
+                if (!EmptyClipboard()) return false;
+
+                IntPtr h = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)(uint)((text.Length + 1) * 2));
+                if (h == IntPtr.Zero) return false;
+
+                IntPtr p = GlobalLock(h);
+                if (p == IntPtr.Zero) { GlobalFree(h); return false; }
+                try
+                {
+                    Marshal.Copy(text.ToCharArray(), 0, p, text.Length);
+                    Marshal.WriteInt16(p, text.Length * 2, 0);
+                }
+                finally { GlobalUnlock(h); }
+
+                // On success the clipboard takes ownership of the block, so it
+                // must not be freed here; on failure it is still ours.
+                if (SetClipboardData(CF_UNICODETEXT, h) == IntPtr.Zero)
+                {
+                    GlobalFree(h);
+                    return false;
+                }
+                return true;
             }
-            return false;
+            finally { CloseClipboard(); }
         }
 
-        internal static void Clear()
+        internal static bool Clear()
         {
-            for (int i = 0; i < 8; i++)
+            if (!Open()) return false;
+            try { return EmptyClipboard(); }
+            finally { CloseClipboard(); }
+        }
+
+        /// Waits for the foreground app to answer a synthesized Ctrl+C.
+        ///
+        /// Two things matter here. First, the wait is driven by the clipboard
+        /// sequence number, which is a cheap local read and does not touch the
+        /// clipboard owner -- so there is no need to blank the clipboard first
+        /// to tell a fresh copy apart from the old contents. Second, the loop
+        /// pumps messages: the source app's copy is a cross-process call that
+        /// lands in our message queue, so sleeping through it blocks the source
+        /// app just as hard as it blocks us.
+        internal static string WaitForCopy(uint before, int budgetMs)
+        {
+            System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < budgetMs)
             {
-                try { Clipboard.Clear(); return; }
-                catch { Thread.Sleep(60); }
+                Application.DoEvents();
+                Thread.Sleep(15);
+
+                if (Sequence() == before) continue;
+
+                string text = GetText();
+                if (!string.IsNullOrEmpty(text)) return text;
+            }
+            return null;
+        }
+
+        /// A sleep that keeps this process answering messages. Anything that
+        /// waits on another app while that app may be calling back into us has
+        /// to use this, not Thread.Sleep.
+        internal static void PumpSleep(int ms)
+        {
+            System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < ms)
+            {
+                Application.DoEvents();
+                Thread.Sleep(15);
             }
         }
     }
@@ -1027,6 +1179,11 @@ namespace RtlPicker
     {
         private const double Threshold = 0.25;
 
+        /// How long to wait for the foreground app to answer a synthesized
+        /// Ctrl+C. Generous enough for Electron, short enough that an app which
+        /// never answers costs about a second rather than locking the desktop.
+        private const int CopyBudgetMs = 1200;
+
         private readonly NotifyIcon notify = new NotifyIcon();
         private readonly ContextMenuStrip menu = new ContextMenuStrip();
         private readonly HotkeyWindow hotkeys = new HotkeyWindow();
@@ -1040,6 +1197,7 @@ namespace RtlPicker
         private AppFilterForm filterForm;
         private ShortcutForm shortcutForm;
         private bool wrapPerLine = true;
+        private bool busy;
 
         private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RunValue = "RTL Picker";
@@ -1050,6 +1208,11 @@ namespace RtlPicker
             filter.Load();
             wrapPerLine = Config.GetBool("wrapPerLine", true);
 
+            // EmptyClipboard hands ownership to the window that opened the
+            // clipboard, and SetClipboardData refuses to run when that owner is
+            // NULL -- so give Clip a real HWND before anything touches it.
+            Clip.Owner = hotkeys.Handle;
+
             actions = BuildActions();
             LoadShortcutOverrides(actions);
             foreach (HotAction a in actions) byId[a.Id] = a;
@@ -1058,8 +1221,12 @@ namespace RtlPicker
             List<string> rebound = new List<string>();
             RegisterAll(actions, failed, rebound);
 
+            // WaitForCopy pumps messages, so a second press of the chord can
+            // land mid-action and re-enter this handler on the same thread.
             hotkeys.HotkeyPressed += delegate(int id)
             {
+                if (busy) return;
+                busy = true;
                 try
                 {
                     HotAction a;
@@ -1072,6 +1239,7 @@ namespace RtlPicker
                     Log.Write("error: " + ex.Message);
                     toast.Show("RTL Picker error", ex.Message);
                 }
+                finally { busy = false; }
             };
 
             BuildMenu(actions);
@@ -1369,18 +1537,16 @@ namespace RtlPicker
 
             Native.ReleaseModifiers();
             string original = Clip.GetText();
-            Clip.Clear();
+            uint before = Clip.Sequence();
             Native.CtrlKey(0x43); // Ctrl+C
 
-            // Electron can take a while to service the copy; poll for a second.
-            string selected = null;
-            for (int i = 0; i < 20; i++)
-            {
-                Thread.Sleep(50);
-                selected = Clip.GetText();
-                if (!string.IsNullOrEmpty(selected)) break;
-            }
-            Log.Write("  copied: " + Bidi.Describe(selected));
+            // Electron can take a while to service the copy, so wait -- but
+            // bounded, and pumping messages, because the source app is blocked
+            // on us for the duration.
+            long waitStart = Environment.TickCount;
+            string selected = Clip.WaitForCopy(before, CopyBudgetMs);
+            Log.Write("  copied: " + Bidi.Describe(selected)
+                      + " (waited " + (Environment.TickCount - waitStart) + " ms)");
 
             if (string.IsNullOrEmpty(selected))
             {
@@ -1421,7 +1587,11 @@ namespace RtlPicker
             }
 
             Native.CtrlKey(0x56); // Ctrl+V
-            Thread.Sleep(300);
+
+            // The target reads our clipboard to paste, which is a call into this
+            // process. Sleeping through it would stall the paste we just asked
+            // for, so pump instead.
+            Clip.PumpSleep(300);
 
             if (original != null) Clip.SetText(original);
             Log.Write("  -> pasted " + selected.Length + " chars into " + target);
@@ -1460,17 +1630,13 @@ namespace RtlPicker
 
             Native.ReleaseModifiers();
             string original = Clip.GetText();
-            Clip.Clear();
+            uint before = Clip.Sequence();
             Native.CtrlKey(0x43); // Ctrl+C
 
-            string selected = null;
-            for (int i = 0; i < 20; i++)
-            {
-                Thread.Sleep(50);
-                selected = Clip.GetText();
-                if (!string.IsNullOrEmpty(selected)) break;
-            }
-            Log.Write("  copied: " + Bidi.Describe(selected));
+            long waitStart = Environment.TickCount;
+            string selected = Clip.WaitForCopy(before, CopyBudgetMs);
+            Log.Write("  copied: " + Bidi.Describe(selected)
+                      + " (waited " + (Environment.TickCount - waitStart) + " ms)");
 
             // Nothing is pasted, so the clipboard goes back immediately.
             if (original != null) Clip.SetText(original);
